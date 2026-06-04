@@ -70,6 +70,7 @@ function createElement(tagName) {
 }
 
 function loadExtension({
+  connection,
   fetchImpl,
   html = "",
   random = () => 0,
@@ -129,6 +130,7 @@ function loadExtension({
       throw new Error("Unexpected fetch call.");
     }),
     navigator: {
+      connection,
       userAgent: "node-test"
     },
     setTimeout,
@@ -290,6 +292,33 @@ test("retry status and backoff calculations match the intended policy", () => {
   assert.equal(api.retryDelayMs(response({ retryAfter: "2" }), 1), 2000);
   assert.equal(api.retryDelayMs(response({ retryAfter: "999" }), 1), 12000);
   assert.equal(api.retryDelayMs(null, 3), 3200);
+});
+
+test("network profile lowers concurrency and extends page timeouts on slow links", () => {
+  const fast = loadExtension().getNetworkProfile();
+  assert.equal(fast.slow, false);
+  assert.equal(fast.pageConcurrency, 64);
+  assert.equal(fast.pageFetchTimeoutMs, 60000);
+
+  const slow3g = loadExtension({
+    connection: {
+      downlink: 0.4,
+      effectiveType: "3g",
+      rtt: 500,
+      saveData: false
+    }
+  }).getNetworkProfile();
+  assert.equal(slow3g.slow, true);
+  assert.equal(slow3g.pageConcurrency, 8);
+  assert.equal(slow3g.pageFetchTimeoutMs, 180000);
+
+  const saveData = loadExtension({
+    connection: {
+      effectiveType: "4g",
+      saveData: true
+    }
+  }).getNetworkProfile();
+  assert.equal(saveData.slow, true);
 });
 
 test("fetchPageBytesWithRetry retries retryable HTTP errors", async () => {

@@ -19,6 +19,9 @@ Pointer intent has two stages: movement toward the button prefetches the first
 full book. Click-time downloads reuse completed and in-flight prefetch requests,
 and prefetched pages have their PDF objects prepared before the final click.
 The extension also adds same-origin preconnect hints for the page-image requests.
+On slow reported connections such as 3G, it automatically lowers page-image
+parallelism and extends page-image request timeouts so Chrome throttling does
+not cause queued requests to abort and restart repeatedly.
 
 ## Install From Releases
 

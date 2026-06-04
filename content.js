@@ -2,9 +2,12 @@
   "use strict";
 
   const TEXT_ENCODER = new TextEncoder();
-  const PAGE_CONCURRENCY = 64;
+  const DEFAULT_PAGE_CONCURRENCY = 64;
+  const SLOW_PAGE_CONCURRENCY = 8;
   const REQUEST_START_SPACING_MS = 0;
-  const FETCH_TIMEOUT_MS = 30_000;
+  const TEXT_FETCH_TIMEOUT_MS = 30_000;
+  const DEFAULT_PAGE_FETCH_TIMEOUT_MS = 60_000;
+  const SLOW_PAGE_FETCH_TIMEOUT_MS = 180_000;
   const PAGE_RETRIES = 4;
   const MISSING_PAGE_PASSES = 2;
   const RETRY_BASE_MS = 800;
@@ -87,6 +90,33 @@
       return `${Math.round(bytes / 1024)} KB`;
     }
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function getConnectionInfo() {
+    return navigator.connection || navigator.mozConnection || navigator.webkitConnection || null;
+  }
+
+  function getNetworkProfile() {
+    const connection = getConnectionInfo();
+    const effectiveType = String(connection?.effectiveType || "").toLowerCase();
+    const downlink = Number(connection?.downlink);
+    const rtt = Number(connection?.rtt);
+    const saveData = Boolean(connection?.saveData);
+    const slow =
+      saveData ||
+      /^(slow-)?2g$|^3g$/.test(effectiveType) ||
+      (Number.isFinite(downlink) && downlink > 0 && downlink <= 1.5) ||
+      (Number.isFinite(rtt) && rtt >= 500);
+
+    return {
+      downlink: Number.isFinite(downlink) ? downlink : null,
+      effectiveType: effectiveType || null,
+      pageConcurrency: slow ? SLOW_PAGE_CONCURRENCY : DEFAULT_PAGE_CONCURRENCY,
+      pageFetchTimeoutMs: slow ? SLOW_PAGE_FETCH_TIMEOUT_MS : DEFAULT_PAGE_FETCH_TIMEOUT_MS,
+      rtt: Number.isFinite(rtt) ? rtt : null,
+      saveData,
+      slow
+    };
   }
 
   function serializeError(error) {
@@ -509,7 +539,7 @@
       credentials: "include",
       priority: "high",
       referrer: refererUrl || window.location.href
-    }, FETCH_TIMEOUT_MS, signal);
+    }, TEXT_FETCH_TIMEOUT_MS, signal);
     debug?.log("fetch-text-response", {
       url,
       status: response.status,
@@ -857,11 +887,12 @@
   }
 
   async function fetchPageBytesOnce(url, referer, signal) {
+    const networkProfile = getNetworkProfile();
     const response = await fetchWithTimeout(url, {
       credentials: "include",
       priority: "high",
       referrer: referer
-    }, FETCH_TIMEOUT_MS, signal);
+    }, networkProfile.pageFetchTimeoutMs, signal);
     if (!response.ok) {
       if (shouldRetryStatus(response.status)) {
         const error = new Error(`HTTP ${response.status}`);
@@ -981,16 +1012,18 @@
     const errors = new Map();
     const pacer = createRequestPacer(signal, debug);
     const targetPageCount = normalizePageLimit(pageLimit, pageUrls.length);
+    const networkProfile = getNetworkProfile();
     let completed = countDownloadedPages(pages, targetPageCount);
     debug?.log("download-cache-state", {
       cachedPages: completed,
+      networkProfile,
       targetPages: targetPageCount,
       totalPages: pageUrls.length
     });
 
     for (let pass = 1; pass <= MISSING_PAGE_PASSES; pass += 1) {
       const missingIndexes = missingPageIndexes(pages, targetPageCount);
-      const concurrency = Math.min(PAGE_CONCURRENCY, missingIndexes.length);
+      const concurrency = Math.min(networkProfile.pageConcurrency, missingIndexes.length);
       debug?.log("download-pass-start", {
         pass,
         missingCount: missingIndexes.length,
@@ -1786,6 +1819,7 @@
       downloadAllPages,
       extractPageUrls,
       fetchPageBytesWithRetry,
+      getNetworkProfile,
       hasGeneratedPdfSourceInHtml,
       hasDownloadSourceInHtml,
       isPointerNearElement,
