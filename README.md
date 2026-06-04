@@ -10,6 +10,10 @@ are not used because they are slower; if KazNEB shows only a native PDF button,
 the extension leaves it as the site's own download. Cover images such as
 `bigcover.png` are not treated as downloadable book pages.
 
+The extension may warm the viewer page list when the button is inserted, but it
+does not prefetch page image bytes until the user hovers over, or moves the
+pointer near, the injected download button.
+
 ## Install From Releases
 
 1. Download `kazneb-chrome-extension-vX.Y.Z.zip` from the latest GitHub release.

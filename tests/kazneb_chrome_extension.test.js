@@ -145,7 +145,13 @@ function loadExtension({
   return context.window.__kaznebDownloaderTestApi;
 }
 
-function response({ status = 200, bytes = Uint8Array.of(1), contentType = "image/png", retryAfter = null } = {}) {
+function response({
+  status = 200,
+  bytes = Uint8Array.of(1),
+  contentType = "image/png",
+  retryAfter = null,
+  text = ""
+} = {}) {
   return {
     ok: status >= 200 && status < 300,
     status,
@@ -165,7 +171,7 @@ function response({ status = 200, bytes = Uint8Array.of(1), contentType = "image
       return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
     },
     async text() {
-      return "";
+      return text;
     }
   };
 }
@@ -393,6 +399,80 @@ test("downloadAllPages retries pages missed in the first pass", async () => {
   assert.equal(pages.length, 3);
   assert.deepEqual(Array.from(pages, (page) => page.url), urls);
   assert.equal(callsByUrl.get(urls[1]), 2);
+});
+
+test("downloadAllPages reuses prefetched pages and downloads only missing pages", async () => {
+  const urls = [1, 2, 3].map((page) => `https://kazneb.kz/FileStore/book/${String(page).padStart(4, "0")}.png`);
+  const calls = [];
+  const api = loadExtension({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return response({ bytes: Uint8Array.of(Number(url.match(/(\d+)\.png$/)[1])) });
+    }
+  });
+  const initialPages = [
+    { url: urls[0], bytes: Uint8Array.of(1).buffer },
+    null,
+    { url: urls[2], bytes: Uint8Array.of(3).buffer }
+  ];
+
+  const pages = await api.downloadAllPages(
+    urls,
+    "https://kazneb.kz/",
+    () => {},
+    new AbortController().signal,
+    testDebug(),
+    initialPages
+  );
+
+  assert.equal(pages, initialPages);
+  assert.deepEqual(calls, [urls[1]]);
+  assert.equal(api.countDownloadedPages(pages), 3);
+});
+
+test("hover prefetch uses a warmed page list but does not download images before start", async () => {
+  const pageUrls = [1, 2].map((page) => `https://kazneb.kz/FileStore/book/${String(page).padStart(4, "0")}.png`);
+  const calls = [];
+  const api = loadExtension({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return response({ bytes: tinyPngBytes() });
+    }
+  });
+  const manager = api.createHoverPrefetchManager(() => Promise.resolve({
+    pageUrls,
+    referer: "https://kazneb.kz/ru/bookView/view?brId=1&simple=true"
+  }));
+
+  assert.deepEqual(calls, []);
+
+  await manager.start();
+  const prefetched = manager.take();
+
+  assert.deepEqual(calls.sort(), [...pageUrls].sort());
+  assert.equal(prefetched.downloaded, 2);
+  assert.equal(prefetched.total, 2);
+  assert.equal(api.countDownloadedPages(prefetched.pages), 2);
+});
+
+test("pointer proximity treats nearby cursor positions as download intent", () => {
+  const api = loadExtension();
+  const element = {
+    getBoundingClientRect() {
+      return {
+        bottom: 140,
+        left: 100,
+        right: 220,
+        top: 100
+      };
+    }
+  };
+
+  assert.equal(api.isPointerNearElement({ clientX: 80, clientY: 120 }, element, 25), true);
+  assert.equal(api.isPointerNearElement({ clientX: 246, clientY: 120 }, element, 25), false);
+  assert.equal(api.isPointerNearElement({ clientX: 150, clientY: 70 }, element, 35), true);
+  assert.equal(api.isPointerNearElement({ clientX: 150, clientY: 64 }, element, 35), false);
+  assert.equal(api.isPointerNearElement({ clientX: 150, clientY: 120 }, null, 35), false);
 });
 
 test("downloadAllPages reports pages that remain missing after retry passes", async () => {
