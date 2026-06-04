@@ -520,6 +520,69 @@ test("downloadAllPages reuses in-flight page downloads instead of restarting the
   assert.equal(new Uint8Array(pages[1].bytes)[0], 2);
 });
 
+test("downloadAllPages can stop scheduling after a prefetch is claimed", async () => {
+  const urls = [1, 2, 3].map((page) => `https://kazneb.kz/FileStore/book/${String(page).padStart(4, "0")}.png`);
+  const calls = [];
+  const api = loadExtension({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return response({ bytes: Uint8Array.of(1) });
+    }
+  });
+
+  const pages = await api.downloadAllPages(
+    urls,
+    "https://kazneb.kz/",
+    () => {},
+    new AbortController().signal,
+    testDebug(),
+    null,
+    null,
+    null,
+    null,
+    { shouldStopScheduling: () => true }
+  );
+
+  assert.deepEqual(calls, []);
+  assert.equal(api.countDownloadedPages(pages), 0);
+});
+
+test("claimed prefetch in-flight pages are reused without duplicate fetches", async () => {
+  const pageUrls = [1, 2, 3, 4].map((page) => `https://kazneb.kz/FileStore/book/${String(page).padStart(4, "0")}.png`);
+  const calls = [];
+  const api = loadExtension({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return response({ bytes: tinyPngBytes() });
+    }
+  });
+  const manager = api.createHoverPrefetchManager(() => Promise.resolve({
+    pageUrls,
+    referer: "https://kazneb.kz/ru/bookView/view?brId=1&simple=true"
+  }));
+
+  const prefetchPromise = manager.start(2);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const prefetched = manager.take();
+
+  const pages = await api.downloadAllPages(
+    pageUrls,
+    prefetched.referer,
+    () => {},
+    new AbortController().signal,
+    testDebug(),
+    prefetched.pages,
+    null,
+    prefetched.inFlightPages
+  );
+  await prefetchPromise;
+
+  assert.equal(api.countDownloadedPages(pages), 4);
+  assert.equal(calls.length, 4);
+  assert.deepEqual(new Set(calls), new Set(pageUrls));
+});
+
 test("hover prefetch uses a warmed page list but does not download images before start", async () => {
   const pageUrls = [1, 2].map((page) => `https://kazneb.kz/FileStore/book/${String(page).padStart(4, "0")}.png`);
   const calls = [];

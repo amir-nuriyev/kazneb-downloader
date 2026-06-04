@@ -22,6 +22,9 @@ The extension also adds same-origin preconnect hints for the page-image requests
 On slow reported connections such as 3G, it automatically lowers page-image
 parallelism and extends page-image request timeouts so Chrome throttling does
 not cause queued requests to abort and restart repeatedly.
+When the user clicks during prefetch, the visible download claims the prefetch
+cache, reuses in-flight page requests, and stops the background prefetch
+scheduler from starting competing work.
 
 ## Install From Releases
 

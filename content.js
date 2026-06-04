@@ -1004,7 +1004,8 @@
     initialPages = null,
     pageLimit = null,
     inFlightPages = null,
-    onPageStored = null
+    onPageStored = null,
+    options = {}
   ) {
     const pages = Array.isArray(initialPages) && initialPages.length === pageUrls.length
       ? initialPages
@@ -1013,6 +1014,9 @@
     const pacer = createRequestPacer(signal, debug);
     const targetPageCount = normalizePageLimit(pageLimit, pageUrls.length);
     const networkProfile = getNetworkProfile();
+    const shouldStopScheduling = typeof options.shouldStopScheduling === "function"
+      ? options.shouldStopScheduling
+      : null;
     let completed = countDownloadedPages(pages, targetPageCount);
     debug?.log("download-cache-state", {
       cachedPages: completed,
@@ -1049,9 +1053,35 @@
       const downloadWorker = async (workerId) => {
         while (cursor < missingIndexes.length) {
           throwIfAborted(signal);
+          if (shouldStopScheduling?.()) {
+            debug?.log("download-pass-claimed-stop", {
+              completed,
+              pass,
+              targetPages: targetPageCount,
+              totalPages: pageUrls.length,
+              workerId
+            });
+            return;
+          }
           const index = missingIndexes[cursor];
           cursor += 1;
           const pageNumber = pageNumberFromUrl(pageUrls[index], index + 1);
+          if (pages[index] && pages[index].bytes) {
+            completed += 1;
+            setProgress(
+              5 + Math.round((completed / targetPageCount) * 95),
+              `Downloading pages ${completed}/${targetPageCount}...`
+            );
+            debug?.log("page-cache-hit-late", {
+              completed,
+              index,
+              pageNumber,
+              targetPages: targetPageCount,
+              totalPages: pageUrls.length,
+              workerId
+            });
+            continue;
+          }
           const percent = 5 + Math.round((completed / targetPageCount) * 95);
           setProgress(
             percent,
@@ -1061,6 +1091,14 @@
           try {
             let pagePromise = inFlightPages ? inFlightPages[index] : null;
             if (!pagePromise) {
+              if (shouldStopScheduling?.()) {
+                debug?.log("page-start-skipped-after-claim", {
+                  index,
+                  pageNumber,
+                  workerId
+                });
+                return;
+              }
               pagePromise = fetchPageBytesWithRetry(pageUrls[index], referer, {
                 pageNumber,
                 totalPages: pageUrls.length,
@@ -1125,6 +1163,16 @@
       await Promise.all(
         Array.from({ length: concurrency }, (_, workerIndex) => downloadWorker(workerIndex + 1))
       );
+
+      if (shouldStopScheduling?.()) {
+        debug?.log("download-claimed-stop", {
+          completed,
+          pass,
+          targetPages: targetPageCount,
+          totalPages: pageUrls.length
+        });
+        return pages;
+      }
     }
 
     const stillMissing = missingPageIndexes(pages, targetPageCount).map((index) => index + 1);
@@ -1206,6 +1254,7 @@
         promise: null,
         referer: null,
         running: false,
+        claimed: false,
         targetLimit: normalizePrefetchLimit(pageLimit)
       };
     };
@@ -1273,7 +1322,10 @@
             current.pages,
             targetPages,
             current.inFlightPages,
-            (page) => prebuildPdfPage(page, 300, debug)
+            (page) => prebuildPdfPage(page, 300, debug),
+            {
+              shouldStopScheduling: () => current.claimed
+            }
           );
           const cachedAfter = countDownloadedPages(current.pages, targetPages);
           debug.log("prefetch-target-done", {
@@ -1330,6 +1382,7 @@
         if (prefetch === current) {
           prefetch = null;
         }
+        current.claimed = true;
 
         if (!current.pageUrls || !current.referer || !current.pages) {
           releasePageBytes(current.pages);
