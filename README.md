@@ -14,6 +14,12 @@ The extension may warm the viewer page list when the button is inserted, but it
 does not prefetch page image bytes until the user hovers over, or moves the
 pointer near, the injected download button.
 
+Pointer intent has two stages: movement toward the button prefetches the first
+20 pages, while hovering or moving very close upgrades that same cache to the
+full book. Click-time downloads reuse completed and in-flight prefetch requests,
+and prefetched pages have their PDF objects prepared before the final click.
+The extension also adds same-origin preconnect hints for the page-image requests.
+
 ## Install From Releases
 
 1. Download `kazneb-chrome-extension-vX.Y.Z.zip` from the latest GitHub release.

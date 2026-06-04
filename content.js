@@ -11,7 +11,10 @@
   const RETRY_MAX_MS = 12_000;
   const RATE_LIMIT_COOLDOWN_MS = 5_000;
   const PREFETCH_CACHE_TTL_MS = 5 * 60_000;
-  const PREFETCH_POINTER_PROXIMITY_PX = 160;
+  const PREFETCH_APPROACH_PAGE_LIMIT = 20;
+  const PREFETCH_APPROACH_PROXIMITY_PX = 560;
+  const PREFETCH_APPROACH_MIN_PROGRESS_PX = 18;
+  const PREFETCH_CLOSE_PROXIMITY_PX = 180;
 
   if (window.__kaznebDownloaderLoaded) {
     return;
@@ -382,9 +385,17 @@
     return Number.isFinite(number) ? number : fallback;
   }
 
-  function missingPageIndexes(pages) {
+  function normalizePageLimit(pageLimit, totalPages) {
+    if (!Number.isFinite(pageLimit)) {
+      return totalPages;
+    }
+    return Math.max(0, Math.min(totalPages, Math.floor(pageLimit)));
+  }
+
+  function missingPageIndexes(pages, pageLimit = null) {
     const missing = [];
-    for (let index = 0; index < pages.length; index += 1) {
+    const limit = normalizePageLimit(pageLimit, pages.length);
+    for (let index = 0; index < limit; index += 1) {
       if (!pages[index] || !pages[index].bytes) {
         missing.push(index);
       }
@@ -392,11 +403,18 @@
     return missing;
   }
 
-  function countDownloadedPages(pages) {
+  function countDownloadedPages(pages, pageLimit = null) {
     if (!Array.isArray(pages)) {
       return 0;
     }
-    return pages.reduce((count, page) => count + (page && page.bytes ? 1 : 0), 0);
+    const limit = normalizePageLimit(pageLimit, pages.length);
+    let count = 0;
+    for (let index = 0; index < limit; index += 1) {
+      if (pages[index] && pages[index].bytes) {
+        count += 1;
+      }
+    }
+    return count;
   }
 
   function releasePageBytes(pages) {
@@ -406,9 +424,17 @@
     pages.forEach((page) => {
       if (page) {
         page.bytes = null;
+        page.pdfPrepared = null;
       }
     });
     pages.length = 0;
+  }
+
+  function normalizePrefetchLimit(pageLimit) {
+    if (!Number.isFinite(pageLimit) || pageLimit <= 0) {
+      return null;
+    }
+    return Math.floor(pageLimit);
   }
 
   function isPointerNearElement(event, element, distancePx) {
@@ -422,6 +448,59 @@
       event.clientY >= rect.top - distancePx &&
       event.clientY <= rect.bottom + distancePx
     );
+  }
+
+  function pointerDistanceToElement(event, element) {
+    if (!event || !element || typeof element.getBoundingClientRect !== "function") {
+      return Number.POSITIVE_INFINITY;
+    }
+    const rect = element.getBoundingClientRect();
+    const dx = event.clientX < rect.left
+      ? rect.left - event.clientX
+      : Math.max(0, event.clientX - rect.right);
+    const dy = event.clientY < rect.top
+      ? rect.top - event.clientY
+      : Math.max(0, event.clientY - rect.bottom);
+    return Math.hypot(dx, dy);
+  }
+
+  function isPointerMovingTowardElement(previousEvent, event, element, maxDistancePx, minProgressPx) {
+    if (!previousEvent || !event) {
+      return false;
+    }
+    const previousDistance = pointerDistanceToElement(previousEvent, element);
+    const currentDistance = pointerDistanceToElement(event, element);
+    return (
+      currentDistance <= maxDistancePx &&
+      previousDistance - currentDistance >= minProgressPx
+    );
+  }
+
+  function abortableResult(promise, signal) {
+    throwIfAborted(signal);
+    if (!signal) {
+      return promise;
+    }
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        cleanup();
+        reject(new DOMException("Download cancelled.", "AbortError"));
+      };
+      const cleanup = () => {
+        signal.removeEventListener("abort", onAbort);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      promise.then(
+        (value) => {
+          cleanup();
+          resolve(value);
+        },
+        (error) => {
+          cleanup();
+          reject(error);
+        }
+      );
+    });
   }
 
   async function fetchText(url, refererUrl, signal, debug) {
@@ -637,6 +716,69 @@
     ]);
   }
 
+  function preparePdfPage(page, dpi) {
+    if (page.pdfPrepared && page.pdfPrepared.dpi === dpi) {
+      return page.pdfPrepared;
+    }
+
+    const png = parsePng(new Uint8Array(page.bytes));
+    const decodeParms =
+      `<< /Predictor 15 /Colors ${png.colors} ` +
+      `/BitsPerComponent ${png.bitDepth} /Columns ${png.width} >>`;
+    const imageDictionary =
+      `/Type /XObject /Subtype /Image /Width ${png.width} /Height ${png.height} ` +
+      `/ColorSpace ${png.colorSpace} /BitsPerComponent ${png.bitDepth} ` +
+      `/Filter /FlateDecode /DecodeParms ${decodeParms}`;
+    const pageWidth = (png.width * 72) / dpi;
+    const pageHeight = (png.height * 72) / dpi;
+    const content = encodeText(
+      `q\n${pdfNumber(pageWidth)} 0 0 ${pdfNumber(pageHeight)} 0 0 cm\n/Im0 Do\nQ\n`
+    );
+
+    page.pdfPrepared = {
+      contentStream: makeStream("", content),
+      dpi,
+      imageStream: makeStream(imageDictionary, png.idat),
+      pageHeight,
+      pageWidth
+    };
+    return page.pdfPrepared;
+  }
+
+  function prebuildPdfPage(page, dpi, debug) {
+    if (!page || !page.bytes) {
+      return null;
+    }
+    try {
+      return preparePdfPage(page, dpi);
+    } catch (error) {
+      debug?.log("pdf-prebuild-failed", {
+        url: page.url,
+        error: serializeError(error)
+      });
+      return null;
+    }
+  }
+
+  function warmKaznebTransport() {
+    const host = document.head || document.documentElement;
+    if (!host || document.getElementById("kazneb-dl-preconnect")) {
+      return;
+    }
+
+    const preconnect = document.createElement("link");
+    preconnect.id = "kazneb-dl-preconnect";
+    preconnect.rel = "preconnect";
+    preconnect.href = window.location.origin;
+    host.appendChild(preconnect);
+
+    const dnsPrefetch = document.createElement("link");
+    dnsPrefetch.id = "kazneb-dl-dns-prefetch";
+    dnsPrefetch.rel = "dns-prefetch";
+    dnsPrefetch.href = window.location.origin;
+    host.appendChild(dnsPrefetch);
+  }
+
   function buildPdfFromPngs(pages, dpi, setProgress) {
     if (!pages || !pages.length) {
       throw new Error("No pages were downloaded; refusing to create an empty PDF.");
@@ -654,31 +796,19 @@
     const pageIds = [];
 
     pages.forEach((page, index) => {
-      const png = parsePng(new Uint8Array(page.bytes));
+      const prepared = preparePdfPage(page, dpi);
       const imageObjectId = objects.length + 1;
-      const decodeParms =
-        `<< /Predictor 15 /Colors ${png.colors} ` +
-        `/BitsPerComponent ${png.bitDepth} /Columns ${png.width} >>`;
-      const imageDictionary =
-        `/Type /XObject /Subtype /Image /Width ${png.width} /Height ${png.height} ` +
-        `/ColorSpace ${png.colorSpace} /BitsPerComponent ${png.bitDepth} ` +
-        `/Filter /FlateDecode /DecodeParms ${decodeParms}`;
-      objects.push(makeStream(imageDictionary, png.idat));
+      objects.push(prepared.imageStream);
 
-      const pageWidth = (png.width * 72) / dpi;
-      const pageHeight = (png.height * 72) / dpi;
-      const content = encodeText(
-        `q\n${pdfNumber(pageWidth)} 0 0 ${pdfNumber(pageHeight)} 0 0 cm\n/Im0 Do\nQ\n`
-      );
       const contentObjectId = objects.length + 1;
-      objects.push(makeStream("", content));
+      objects.push(prepared.contentStream);
 
       const pageObjectId = objects.length + 1;
       pageIds.push(pageObjectId);
       objects.push(
         encodeText(
           `<< /Type /Page /Parent 2 0 R ` +
-            `/MediaBox [0 0 ${pdfNumber(pageWidth)} ${pdfNumber(pageHeight)}] ` +
+            `/MediaBox [0 0 ${pdfNumber(prepared.pageWidth)} ${pdfNumber(prepared.pageHeight)}] ` +
             `/Resources << /XObject << /Im0 ${imageObjectId} 0 R >> >> ` +
             `/Contents ${contentObjectId} 0 R >>`
         )
@@ -834,26 +964,39 @@
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
   }
 
-  async function downloadAllPages(pageUrls, referer, setProgress, signal, debug, initialPages = null) {
+  async function downloadAllPages(
+    pageUrls,
+    referer,
+    setProgress,
+    signal,
+    debug,
+    initialPages = null,
+    pageLimit = null,
+    inFlightPages = null,
+    onPageStored = null
+  ) {
     const pages = Array.isArray(initialPages) && initialPages.length === pageUrls.length
       ? initialPages
       : new Array(pageUrls.length).fill(null);
     const errors = new Map();
     const pacer = createRequestPacer(signal, debug);
-    let completed = countDownloadedPages(pages);
+    const targetPageCount = normalizePageLimit(pageLimit, pageUrls.length);
+    let completed = countDownloadedPages(pages, targetPageCount);
     debug?.log("download-cache-state", {
       cachedPages: completed,
+      targetPages: targetPageCount,
       totalPages: pageUrls.length
     });
 
     for (let pass = 1; pass <= MISSING_PAGE_PASSES; pass += 1) {
-      const missingIndexes = missingPageIndexes(pages);
+      const missingIndexes = missingPageIndexes(pages, targetPageCount);
       const concurrency = Math.min(PAGE_CONCURRENCY, missingIndexes.length);
       debug?.log("download-pass-start", {
         pass,
         missingCount: missingIndexes.length,
         concurrency,
         completed,
+        targetPages: targetPageCount,
         totalPages: pageUrls.length,
         requestStartSpacingMs: REQUEST_START_SPACING_MS
       });
@@ -864,7 +1007,7 @@
 
       if (pass > 1) {
         setProgress(
-          5 + Math.round((completed / pageUrls.length) * 95),
+          5 + Math.round((completed / targetPageCount) * 95),
           `Retrying ${missingIndexes.length} missing page${missingIndexes.length === 1 ? "" : "s"}...`
         );
       }
@@ -876,34 +1019,59 @@
           const index = missingIndexes[cursor];
           cursor += 1;
           const pageNumber = pageNumberFromUrl(pageUrls[index], index + 1);
-          const percent = 5 + Math.round((completed / pageUrls.length) * 95);
+          const percent = 5 + Math.round((completed / targetPageCount) * 95);
           setProgress(
             percent,
-            `Downloading pages ${completed}/${pageUrls.length}...`
+            `Downloading pages ${completed}/${targetPageCount}...`
           );
 
           try {
-            const bytes = await fetchPageBytesWithRetry(pageUrls[index], referer, {
-              pageNumber,
-              totalPages: pageUrls.length,
-              signal,
-              setProgress,
-              debug,
-              pacer,
-              workerId
-            });
-            pages[index] = { url: pageUrls[index], bytes };
+            let pagePromise = inFlightPages ? inFlightPages[index] : null;
+            if (!pagePromise) {
+              pagePromise = fetchPageBytesWithRetry(pageUrls[index], referer, {
+                pageNumber,
+                totalPages: pageUrls.length,
+                signal,
+                setProgress,
+                debug,
+                pacer,
+                workerId
+              }).then((bytes) => {
+                const page = { url: pageUrls[index], bytes };
+                pages[index] = page;
+                onPageStored?.(page, index);
+                return page;
+              }).finally(() => {
+                if (inFlightPages && inFlightPages[index] === pagePromise) {
+                  inFlightPages[index] = null;
+                }
+              });
+              if (inFlightPages) {
+                inFlightPages[index] = pagePromise;
+              }
+            } else {
+              debug?.log("page-await-inflight", {
+                pageNumber,
+                index,
+                workerId
+              });
+            }
+            const page = await abortableResult(pagePromise, signal);
+            if (page && page.bytes) {
+              pages[index] = page;
+            }
             errors.delete(index);
             completed += 1;
             setProgress(
-              5 + Math.round((completed / pageUrls.length) * 95),
-              `Downloading pages ${completed}/${pageUrls.length}...`
+              5 + Math.round((completed / targetPageCount) * 95),
+              `Downloading pages ${completed}/${targetPageCount}...`
             );
             debug?.log("page-stored", {
               pageNumber,
               index,
               workerId,
               completed,
+              targetPages: targetPageCount,
               totalPages: pageUrls.length
             });
           } catch (error) {
@@ -926,7 +1094,7 @@
       );
     }
 
-    const stillMissing = missingPageIndexes(pages).map((index) => index + 1);
+    const stillMissing = missingPageIndexes(pages, targetPageCount).map((index) => index + 1);
 
     if (stillMissing.length) {
       const sample = stillMissing.slice(0, 12).join(", ");
@@ -945,6 +1113,7 @@
 
     debug?.log("download-all-pages-done", {
       completed,
+      targetPages: targetPageCount,
       totalPages: pageUrls.length
     });
     return pages;
@@ -992,37 +1161,75 @@
       }
     };
 
-    return {
-      start() {
-        if (prefetch && !prefetch.error) {
-          return prefetch.promise;
-        }
+    const createPrefetchState = (pageLimit) => {
+      const controller = new AbortController();
+      return {
+        controller,
+        debug: createDebugCollector(),
+        error: null,
+        inFlightPages: null,
+        pageUrls: null,
+        pages: null,
+        promise: null,
+        referer: null,
+        running: false,
+        targetLimit: normalizePrefetchLimit(pageLimit)
+      };
+    };
 
-        clearPrefetch(prefetch, true);
-        const controller = new AbortController();
-        const debug = createDebugCollector();
-        const current = {
-          controller,
-          debug,
-          error: null,
-          pageUrls: null,
-          pages: null,
-          promise: null,
-          referer: null
-        };
-        prefetch = current;
+    const targetPagesForPrefetch = (current) => {
+      if (!current.pageUrls) {
+        return 0;
+      }
+      return normalizePageLimit(current.targetLimit, current.pageUrls.length);
+    };
 
-        current.promise = (async () => {
-          debug.log("prefetch-start");
-          const warmed = getWarmPages ? await getWarmPages() : null;
-          throwIfAborted(controller.signal);
-          const resolved = warmed || await resolvePages(() => {}, controller.signal, debug);
-          current.pageUrls = resolved.pageUrls;
-          current.referer = resolved.referer;
+    const upgradeTarget = (current, pageLimit) => {
+      const nextLimit = normalizePrefetchLimit(pageLimit);
+      if (current.targetLimit === null) {
+        return;
+      }
+      if (nextLimit === null || nextLimit > current.targetLimit) {
+        current.targetLimit = nextLimit;
+      }
+    };
+
+    const runPrefetch = (current) => {
+      if (current.running) {
+        return current.promise;
+      }
+
+      current.running = true;
+      current.promise = (async () => {
+        const { controller, debug } = current;
+        debug.log("prefetch-start", {
+          targetLimit: current.targetLimit
+        });
+        const warmed = getWarmPages ? await getWarmPages() : null;
+        throwIfAborted(controller.signal);
+        const resolved = warmed || await resolvePages(() => {}, controller.signal, debug);
+        current.pageUrls = resolved.pageUrls;
+        current.referer = resolved.referer;
+        current.bookId = resolved.bookId || inferBookId(resolved.referer || window.location.href, resolved.pageUrls);
+        current.bookTitle = resolved.bookTitle || inferBookTitle(current.bookId);
+        if (!current.pages || current.pages.length !== resolved.pageUrls.length) {
           current.pages = new Array(resolved.pageUrls.length).fill(null);
-          debug.log("prefetch-pages-resolved", {
-            count: resolved.pageUrls.length,
-            referer: resolved.referer
+        }
+        if (!current.inFlightPages || current.inFlightPages.length !== resolved.pageUrls.length) {
+          current.inFlightPages = new Array(resolved.pageUrls.length).fill(null);
+        }
+        debug.log("prefetch-pages-resolved", {
+          count: resolved.pageUrls.length,
+          referer: resolved.referer
+        });
+
+        while (true) {
+          const targetPages = targetPagesForPrefetch(current);
+          const cachedBefore = countDownloadedPages(current.pages, targetPages);
+          debug.log("prefetch-target-start", {
+            cachedPages: cachedBefore,
+            targetPages,
+            totalPages: resolved.pageUrls.length
           });
           await downloadAllPages(
             resolved.pageUrls,
@@ -1030,26 +1237,55 @@
             () => {},
             controller.signal,
             debug,
-            current.pages
+            current.pages,
+            targetPages,
+            current.inFlightPages,
+            (page) => prebuildPdfPage(page, 300, debug)
           );
-          debug.log("prefetch-done", {
-            cachedPages: countDownloadedPages(current.pages),
+          const cachedAfter = countDownloadedPages(current.pages, targetPages);
+          debug.log("prefetch-target-done", {
+            cachedPages: cachedAfter,
+            targetPages,
             totalPages: resolved.pageUrls.length
           });
-          scheduleCleanup(current);
-        })().catch((error) => {
-          current.error = error;
-          debug.log(error && error.name === "AbortError" ? "prefetch-aborted" : "prefetch-error", {
-            cachedPages: countDownloadedPages(current.pages),
-            totalPages: current.pageUrls ? current.pageUrls.length : 0,
-            error: serializeError(error)
-          });
-          if (error && error.name !== "AbortError") {
-            scheduleCleanup(current, 30_000);
+          if (targetPagesForPrefetch(current) <= targetPages) {
+            break;
           }
-        });
+        }
 
-        return current.promise;
+        debug.log("prefetch-done", {
+          cachedPages: countDownloadedPages(current.pages),
+          totalPages: resolved.pageUrls.length
+        });
+        scheduleCleanup(current);
+      })().catch((error) => {
+        current.error = error;
+        current.debug.log(error && error.name === "AbortError" ? "prefetch-aborted" : "prefetch-error", {
+          cachedPages: countDownloadedPages(current.pages),
+          totalPages: current.pageUrls ? current.pageUrls.length : 0,
+          error: serializeError(error)
+        });
+        if (error && error.name !== "AbortError") {
+          scheduleCleanup(current, 30_000);
+        }
+      }).finally(() => {
+        current.running = false;
+      });
+
+      return current.promise;
+    };
+
+    return {
+      start(pageLimit = null) {
+        if (prefetch && !prefetch.error) {
+          upgradeTarget(prefetch, pageLimit);
+          return runPrefetch(prefetch);
+        }
+
+        clearPrefetch(prefetch, true);
+        const current = createPrefetchState(pageLimit);
+        prefetch = current;
+        return runPrefetch(current);
       },
       take() {
         const current = prefetch;
@@ -1061,18 +1297,22 @@
         if (prefetch === current) {
           prefetch = null;
         }
-        if (current.controller && !current.controller.signal.aborted) {
-          current.controller.abort();
-        }
 
         if (!current.pageUrls || !current.referer || !current.pages) {
           releasePageBytes(current.pages);
+          if (current.controller && !current.controller.signal.aborted) {
+            current.controller.abort();
+          }
           return null;
         }
 
         const downloaded = countDownloadedPages(current.pages);
         return {
+          bookId: current.bookId,
+          bookTitle: current.bookTitle,
+          controller: current.controller,
           downloaded,
+          inFlightPages: current.inFlightPages,
           pageUrls: current.pageUrls,
           pages: current.pages,
           referer: current.referer,
@@ -1087,6 +1327,15 @@
 
   async function downloadPdf(setProgress, signal, debug, prefetched = null) {
     let pages = [];
+    const prefetchController = prefetched && prefetched.controller;
+    const abortPrefetch = () => {
+      if (prefetchController && !prefetchController.signal.aborted) {
+        prefetchController.abort();
+      }
+    };
+    if (signal && prefetchController) {
+      signal.addEventListener("abort", abortPrefetch, { once: true });
+    }
 
     try {
       debug?.log("download-start");
@@ -1101,13 +1350,17 @@
       const prefetchedPages = Array.isArray(prefetched?.pages) && prefetched.pages.length === pageUrls.length
         ? prefetched.pages
         : null;
+      const inFlightPages = Array.isArray(prefetched?.inFlightPages) && prefetched.inFlightPages.length === pageUrls.length
+        ? prefetched.inFlightPages
+        : null;
       const prefetchedCount = countDownloadedPages(prefetchedPages);
-      const bookId = inferBookId(referer || window.location.href, pageUrls);
-      const bookTitle = inferBookTitle(bookId);
+      const bookId = prefetched?.bookId || inferBookId(referer || window.location.href, pageUrls);
+      const bookTitle = prefetched?.bookTitle || inferBookTitle(bookId);
       debug?.log("pages-resolved", {
         bookId,
         bookTitle,
         count: pageUrls.length,
+        inFlight: inFlightPages ? inFlightPages.filter(Boolean).length : 0,
         prefetched: prefetchedCount,
         referer,
         firstUrl: pageUrls[0],
@@ -1119,7 +1372,16 @@
           `Using prefetched pages ${prefetchedCount}/${pageUrls.length}...`
         );
       }
-      pages = await downloadAllPages(pageUrls, referer, setProgress, signal, debug, prefetchedPages);
+      pages = await downloadAllPages(
+        pageUrls,
+        referer,
+        setProgress,
+        signal,
+        debug,
+        prefetchedPages,
+        null,
+        inFlightPages
+      );
 
       throwIfAborted(signal);
       setProgress(100, "Compiling PDF...");
@@ -1140,6 +1402,10 @@
         pageCount: pages.length
       };
     } finally {
+      if (signal && prefetchController) {
+        signal.removeEventListener("abort", abortPrefetch);
+      }
+      abortPrefetch();
       releasePageBytes(pages);
     }
   }
@@ -1213,6 +1479,8 @@
       return Boolean(officialButton);
     }
 
+    warmKaznebTransport();
+
     if (document.getElementById("kazneb-download-inline-button")) {
       hideOfficialDownloadButton(officialButton);
       return true;
@@ -1262,13 +1530,20 @@
     const debugCopy = progressWrap.querySelector(".kazneb-dl-debug-copy");
     let activeController = null;
     let currentRunToken = 0;
+    let lastPointerEvent = null;
     let warmPages = null;
-    let intentPrefetchStarted = false;
+    let partialPrefetchStarted = false;
+    let fullPrefetchStarted = false;
     let pointerProximityArmed = false;
     const warmPagesPromise = resolvePages(() => {}, null, null)
       .then((pages) => {
-        warmPages = pages;
-        return pages;
+        const bookId = inferBookId(pages.referer || window.location.href, pages.pageUrls);
+        warmPages = {
+          ...pages,
+          bookId,
+          bookTitle: inferBookTitle(bookId)
+        };
+        return warmPages;
       })
       .catch(() => null);
     const prefetchManager = createHoverPrefetchManager(() => warmPages || warmPagesPromise);
@@ -1342,11 +1617,20 @@
       }
     });
 
-    const startIntentPrefetch = () => {
-      if (activeController || intentPrefetchStarted) {
+    const startApproachPrefetch = () => {
+      if (activeController || partialPrefetchStarted || fullPrefetchStarted) {
         return;
       }
-      intentPrefetchStarted = true;
+      partialPrefetchStarted = true;
+      void prefetchManager.start(PREFETCH_APPROACH_PAGE_LIMIT);
+    };
+
+    const startFullPrefetch = () => {
+      if (activeController || fullPrefetchStarted) {
+        return;
+      }
+      fullPrefetchStarted = true;
+      partialPrefetchStarted = true;
       disarmPointerProximity();
       void prefetchManager.start();
     };
@@ -1356,8 +1640,21 @@
         disarmPointerProximity();
         return;
       }
-      if (isPointerNearElement(event, button, PREFETCH_POINTER_PROXIMITY_PX)) {
-        startIntentPrefetch();
+      const previousPointerEvent = lastPointerEvent;
+      lastPointerEvent = {
+        clientX: event.clientX,
+        clientY: event.clientY
+      };
+      if (isPointerNearElement(event, button, PREFETCH_CLOSE_PROXIMITY_PX)) {
+        startFullPrefetch();
+      } else if (isPointerMovingTowardElement(
+        previousPointerEvent,
+        event,
+        button,
+        PREFETCH_APPROACH_PROXIMITY_PX,
+        PREFETCH_APPROACH_MIN_PROGRESS_PX
+      )) {
+        startApproachPrefetch();
       }
     };
 
@@ -1375,7 +1672,7 @@
       }
     }
 
-    button.addEventListener("pointerenter", startIntentPrefetch);
+    button.addEventListener("pointerenter", startFullPrefetch);
     armPointerProximity();
 
     button.addEventListener("click", async (event) => {
@@ -1387,7 +1684,9 @@
         currentRunToken += 1;
         controller.abort();
         prefetchManager.abort();
-        intentPrefetchStarted = false;
+        partialPrefetchStarted = false;
+        fullPrefetchStarted = false;
+        lastPointerEvent = null;
         armPointerProximity();
         hideProgress();
         setBusy(false);
@@ -1446,7 +1745,9 @@
         if (runToken === currentRunToken) {
           activeController = null;
           setBusy(false);
-          intentPrefetchStarted = false;
+          partialPrefetchStarted = false;
+          fullPrefetchStarted = false;
+          lastPointerEvent = null;
           armPointerProximity();
         }
       }
@@ -1477,6 +1778,7 @@
   if (window.__kaznebDownloaderExposeTestApi) {
     window.__kaznebDownloaderTestApi = {
       abortableDelay,
+      abortableResult,
       buildPdfFromPngs,
       createRequestPacer,
       countDownloadedPages,
@@ -1487,7 +1789,11 @@
       hasGeneratedPdfSourceInHtml,
       hasDownloadSourceInHtml,
       isPointerNearElement,
+      isPointerMovingTowardElement,
       missingPageIndexes,
+      pointerDistanceToElement,
+      prebuildPdfPage,
+      preparePdfPage,
       retryDelayMs,
       shouldInject,
       shouldRetryStatus

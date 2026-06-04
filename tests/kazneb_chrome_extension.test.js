@@ -430,6 +430,67 @@ test("downloadAllPages reuses prefetched pages and downloads only missing pages"
   assert.equal(api.countDownloadedPages(pages), 3);
 });
 
+test("downloadAllPages can target only the first N pages for approach prefetch", async () => {
+  const urls = [1, 2, 3, 4].map((page) => `https://kazneb.kz/FileStore/book/${String(page).padStart(4, "0")}.png`);
+  const calls = [];
+  const api = loadExtension({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return response({ bytes: Uint8Array.of(Number(url.match(/(\d+)\.png$/)[1])) });
+    }
+  });
+
+  const pages = await api.downloadAllPages(
+    urls,
+    "https://kazneb.kz/",
+    () => {},
+    new AbortController().signal,
+    testDebug(),
+    null,
+    2
+  );
+
+  assert.deepEqual(calls.sort(), urls.slice(0, 2).sort());
+  assert.equal(api.countDownloadedPages(pages), 2);
+  assert.deepEqual(Array.from(api.missingPageIndexes(pages, 2)), []);
+  assert.deepEqual(Array.from(api.missingPageIndexes(pages)), [2, 3]);
+});
+
+test("downloadAllPages reuses in-flight page downloads instead of restarting them", async () => {
+  const urls = [1, 2].map((page) => `https://kazneb.kz/FileStore/book/${String(page).padStart(4, "0")}.png`);
+  const calls = [];
+  let resolveInFlight;
+  const inFlightPages = [
+    null,
+    new Promise((resolve) => {
+      resolveInFlight = () => resolve({ url: urls[1], bytes: Uint8Array.of(2).buffer });
+    })
+  ];
+  const api = loadExtension({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return response({ bytes: Uint8Array.of(1) });
+    }
+  });
+
+  const downloadPromise = api.downloadAllPages(
+    urls,
+    "https://kazneb.kz/",
+    () => {},
+    new AbortController().signal,
+    testDebug(),
+    null,
+    null,
+    inFlightPages
+  );
+  resolveInFlight();
+  const pages = await downloadPromise;
+
+  assert.deepEqual(calls, [urls[0]]);
+  assert.equal(api.countDownloadedPages(pages), 2);
+  assert.equal(new Uint8Array(pages[1].bytes)[0], 2);
+});
+
 test("hover prefetch uses a warmed page list but does not download images before start", async () => {
   const pageUrls = [1, 2].map((page) => `https://kazneb.kz/FileStore/book/${String(page).padStart(4, "0")}.png`);
   const calls = [];
@@ -453,6 +514,43 @@ test("hover prefetch uses a warmed page list but does not download images before
   assert.equal(prefetched.downloaded, 2);
   assert.equal(prefetched.total, 2);
   assert.equal(api.countDownloadedPages(prefetched.pages), 2);
+  assert.ok(prefetched.pages[0].pdfPrepared);
+});
+
+test("approach prefetch downloads a capped page set and can upgrade to full", async () => {
+  const pageUrls = [1, 2, 3, 4].map((page) => `https://kazneb.kz/FileStore/book/${String(page).padStart(4, "0")}.png`);
+  const calls = [];
+  const api = loadExtension({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return response({ bytes: tinyPngBytes() });
+    }
+  });
+  const manager = api.createHoverPrefetchManager(() => Promise.resolve({
+    pageUrls,
+    referer: "https://kazneb.kz/ru/bookView/view?brId=1&simple=true"
+  }));
+
+  await manager.start(2);
+  let prefetched = manager.take();
+
+  assert.equal(prefetched.downloaded, 2);
+  assert.equal(prefetched.total, 4);
+  assert.deepEqual(calls.sort(), pageUrls.slice(0, 2).sort());
+  assert.ok(prefetched.pages[0].pdfPrepared);
+
+  const manager2 = api.createHoverPrefetchManager(() => Promise.resolve({
+    pageUrls,
+    referer: "https://kazneb.kz/ru/bookView/view?brId=1&simple=true"
+  }));
+  calls.length = 0;
+  await manager2.start(2);
+  await manager2.start();
+  prefetched = manager2.take();
+
+  assert.equal(prefetched.downloaded, 4);
+  assert.equal(prefetched.total, 4);
+  assert.deepEqual(calls.sort(), pageUrls.sort());
 });
 
 test("pointer proximity treats nearby cursor positions as download intent", () => {
@@ -473,6 +571,27 @@ test("pointer proximity treats nearby cursor positions as download intent", () =
   assert.equal(api.isPointerNearElement({ clientX: 150, clientY: 70 }, element, 35), true);
   assert.equal(api.isPointerNearElement({ clientX: 150, clientY: 64 }, element, 35), false);
   assert.equal(api.isPointerNearElement({ clientX: 150, clientY: 120 }, null, 35), false);
+  assert.equal(api.pointerDistanceToElement({ clientX: 50, clientY: 120 }, element), 50);
+  assert.equal(
+    api.isPointerMovingTowardElement(
+      { clientX: 20, clientY: 120 },
+      { clientX: 70, clientY: 120 },
+      element,
+      560,
+      18
+    ),
+    true
+  );
+  assert.equal(
+    api.isPointerMovingTowardElement(
+      { clientX: 70, clientY: 120 },
+      { clientX: 60, clientY: 120 },
+      element,
+      560,
+      18
+    ),
+    false
+  );
 });
 
 test("downloadAllPages reports pages that remain missing after retry passes", async () => {
