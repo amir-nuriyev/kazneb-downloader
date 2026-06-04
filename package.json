@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
+    "benchmark": "node scripts/benchmark_kazneb_downloads.js",
     "test": "node --test tests/kazneb_chrome_extension.test.js"
   }
 }

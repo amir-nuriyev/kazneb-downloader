@@ -25,8 +25,8 @@ jobs:
       - name: Validate extension
         run: |
           npm test
-          node --check dist/kazneb_chrome_extension/content.js
-          python -m json.tool dist/kazneb_chrome_extension/manifest.json >/dev/null
+          node --check content.js
+          python -m json.tool manifest.json >/dev/null
 
       - name: Determine release tag
         id: release
@@ -34,7 +34,7 @@ jobs:
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             tag="${GITHUB_REF_NAME}"
           else
-            version="$(node -p "require('./dist/kazneb_chrome_extension/manifest.json').version")"
+            version="$(node -p "require('./manifest.json').version")"
             tag="v${version}"
           fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
@@ -42,8 +42,9 @@ jobs:
 
       - name: Package extension
         run: |
-          cd dist
-          zip -r "../${{ steps.release.outputs.asset }}" kazneb_chrome_extension
+          mkdir -p kazneb_chrome_extension
+          cp README.md content.js manifest.json style.css kazneb_chrome_extension/
+          zip -r "${{ steps.release.outputs.asset }}" kazneb_chrome_extension
 
       - name: Create release and upload extension
         env:

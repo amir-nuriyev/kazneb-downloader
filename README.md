@@ -5,9 +5,10 @@ It discovers the page image URLs exposed by the KazNEB viewer, downloads pages i
 parallel with retry/backoff handling, embeds the original PNG streams into a PDF,
 and starts one final PDF download.
 
-Pages that do not expose a viewer, native PDF, or numeric page image URLs are
-ignored. Cover images such as `bigcover.png` are not treated as downloadable
-book pages.
+Generated PDFs are built only from viewer page images. Native `full.pdf` links
+are not used because they are slower; if KazNEB shows only a native PDF button,
+the extension leaves it as the site's own download. Cover images such as
+`bigcover.png` are not treated as downloadable book pages.
 
 ## Install From Releases
 
@@ -20,8 +21,8 @@ book pages.
 
 ## Source Install
 
-You can also load the extension directly from this repository by selecting
-`dist/kazneb_chrome_extension` in Chrome's `Load unpacked` picker.
+You can also load the extension directly from this repository by selecting the
+repository root in Chrome's `Load unpacked` picker.
 
 ## Tests
 
@@ -33,6 +34,17 @@ npm test
 
 The tests cover URL extraction, retry/backoff behavior, rate-limit cooldowns,
 missed-page retry passes, and PDF guard behavior.
+
+## Benchmarking
+
+Benchmark the real KazNEB page-image downloads for the current test books:
+
+```bash
+npm run benchmark
+```
+
+The benchmark reports page counts, bytes, exact elapsed download time, and
+throughput for configurable concurrency/pacing variants.
 
 ## Release Packaging
 

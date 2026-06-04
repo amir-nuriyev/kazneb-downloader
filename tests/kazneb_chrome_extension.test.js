@@ -8,8 +8,6 @@ const { TextEncoder } = require("node:util");
 const CONTENT_PATH = path.join(
   __dirname,
   "..",
-  "dist",
-  "kazneb_chrome_extension",
   "content.js"
 );
 
@@ -232,7 +230,7 @@ test("cover images alone are not treated as downloadable page images", () => {
   assert.equal(api.hasDownloadSourceInHtml(html), false);
 });
 
-test("catalogue pages without a viewer, native PDF, or page images do not inject", () => {
+test("catalogue pages without a viewer, official PDF, or page images do not inject", () => {
   const api = loadExtension({
     url: "https://kazneb.kz/ru/catalogue/view/414682",
     html: `
@@ -242,6 +240,17 @@ test("catalogue pages without a viewer, native PDF, or page images do not inject
   });
 
   assert.equal(api.shouldInject(), false);
+});
+
+test("native PDF alone is not treated as a generated-PDF source", () => {
+  const api = loadExtension({
+    url: "https://kazneb.kz/ru/catalogue/view/999",
+    html: '<a class="download-ico" href="/FileStore/dataFiles/a/b/999/content/full.pdf">Download</a>'
+  });
+
+  assert.equal(api.hasDownloadSourceInHtml('<a href="/content/full.pdf">Download</a>'), true);
+  assert.equal(api.hasGeneratedPdfSourceInHtml('<a href="/content/full.pdf">Download</a>'), false);
+  assert.equal(api.shouldInject(), true);
 });
 
 test("catalogue pages with a viewer link still inject", () => {

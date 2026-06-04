@@ -2,8 +2,8 @@
   "use strict";
 
   const TEXT_ENCODER = new TextEncoder();
-  const PAGE_CONCURRENCY = 32;
-  const REQUEST_START_SPACING_MS = 10;
+  const PAGE_CONCURRENCY = 64;
+  const REQUEST_START_SPACING_MS = 0;
   const FETCH_TIMEOUT_MS = 30_000;
   const PAGE_RETRIES = 4;
   const MISSING_PAGE_PASSES = 2;
@@ -221,9 +221,15 @@
 
   function hasDownloadSourceInHtml(html) {
     return (
+      hasGeneratedPdfSourceInHtml(html) ||
+      /full\.pdf/i.test(html)
+    );
+  }
+
+  function hasGeneratedPdfSourceInHtml(html) {
+    return (
       /pages\.push\(/i.test(html) ||
       /\/bookview\/view/i.test(html) ||
-      /full\.pdf/i.test(html) ||
       /\/FileStore\/[^'"]+\/content\/\d{4}\.(?:png|jpe?g|webp)(?:\?[^'"]*)?/i.test(html)
     );
   }
@@ -277,6 +283,10 @@
 
     return {
       waitTurn(context = {}) {
+        if (REQUEST_START_SPACING_MS <= 0 && Date.now() >= cooldownUntil) {
+          return Promise.resolve();
+        }
+
         const run = gate.then(async () => {
           throwIfAborted(signal);
           const now = Date.now();
@@ -384,6 +394,7 @@
     debug?.log("fetch-text-start", { url });
     const response = await fetchWithTimeout(url, {
       credentials: "include",
+      priority: "high",
       referrer: refererUrl || window.location.href
     }, FETCH_TIMEOUT_MS, signal);
     debug?.log("fetch-text-response", {
@@ -684,6 +695,7 @@
   async function fetchPageBytesOnce(url, referer, signal) {
     const response = await fetchWithTimeout(url, {
       credentials: "include",
+      priority: "high",
       referrer: referer
     }, FETCH_TIMEOUT_MS, signal);
     if (!response.ok) {
@@ -898,13 +910,13 @@
     return pages;
   }
 
-  async function downloadPdf(setProgress, signal, debug) {
+  async function downloadPdf(setProgress, signal, debug, warmPages) {
     let pages = [];
 
     try {
       debug?.log("download-start");
       setProgress(1, "Finding pages...");
-      const { pageUrls, referer } = await resolvePages(setProgress, signal, debug);
+      const { pageUrls, referer } = warmPages || await resolvePages(setProgress, signal, debug);
       if (!pageUrls.length) {
         throw new Error("KazNEB exposed zero page URLs.");
       }
@@ -1008,6 +1020,14 @@
 
   function createInlineControls() {
     const officialButton = patchOfficialDownloadButton();
+    const canGeneratePdf =
+      /\/bookview\/view/i.test(window.location.pathname) ||
+      hasGeneratedPdfSourceInHtml(document.documentElement.outerHTML);
+
+    if (!canGeneratePdf) {
+      removeInlineControls();
+      return Boolean(officialButton);
+    }
 
     if (document.getElementById("kazneb-download-inline-button")) {
       hideOfficialDownloadButton(officialButton);
@@ -1058,6 +1078,14 @@
     const debugCopy = progressWrap.querySelector(".kazneb-dl-debug-copy");
     let activeController = null;
     let currentRunToken = 0;
+    let warmPages = null;
+    const warmPagesPromise = resolvePages(() => {}, null, null)
+      .then((pages) => {
+        warmPages = pages;
+        return pages;
+      })
+      .catch(() => null);
+    void warmPagesPromise;
 
     const setButtonLabel = (text) => {
       label.textContent = text;
@@ -1154,7 +1182,7 @@
       };
 
       try {
-        const result = await downloadPdf(setRunProgress, activeController.signal, debug);
+        const result = await downloadPdf(setRunProgress, activeController.signal, debug, warmPages);
         setRunProgress(98, `Starting download for ${result.fileName}...`);
         saveBlobViaAnchor(result.pdf, result.fileName);
         debug.log("save-started", {
@@ -1217,6 +1245,7 @@
       downloadAllPages,
       extractPageUrls,
       fetchPageBytesWithRetry,
+      hasGeneratedPdfSourceInHtml,
       hasDownloadSourceInHtml,
       missingPageIndexes,
       retryDelayMs,
