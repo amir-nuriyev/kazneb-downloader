@@ -5,6 +5,10 @@ It discovers the page image URLs exposed by the KazNEB viewer, downloads pages i
 parallel with retry/backoff handling, embeds the original PNG streams into a PDF,
 and starts one final PDF download.
 
+Pages that do not expose a viewer, native PDF, or numeric page image URLs are
+ignored. Cover images such as `bigcover.png` are not treated as downloadable
+book pages.
+
 ## Install From Releases
 
 1. Download `kazneb-chrome-extension-vX.Y.Z.zip` from the latest GitHub release.

@@ -201,7 +201,7 @@
 
     if (!urls.length) {
       const fileStorePattern =
-        /['"]([^'"]*\/FileStore\/[^'"]+\.(?:png|jpe?g|webp)(?:\?[^'"]*)?)['"]/gi;
+        /['"]([^'"]*\/FileStore\/[^'"]+\/content\/\d{4}\.(?:png|jpe?g|webp)(?:\?[^'"]*)?)['"]/gi;
       for (const match of html.matchAll(fileStorePattern)) {
         urls.push(match[1]);
       }
@@ -217,6 +217,15 @@
       }
     }
     return normalized;
+  }
+
+  function hasDownloadSourceInHtml(html) {
+    return (
+      /pages\.push\(/i.test(html) ||
+      /\/bookview\/view/i.test(html) ||
+      /full\.pdf/i.test(html) ||
+      /\/FileStore\/[^'"]+\/content\/\d{4}\.(?:png|jpe?g|webp)(?:\?[^'"]*)?/i.test(html)
+    );
   }
 
   function extractViewerUrlFromHtml(html, baseUrl) {
@@ -1195,9 +1204,8 @@
     }
     const html = document.documentElement.outerHTML;
     return (
-      /\/catalogue\/view\/\d+/i.test(window.location.pathname) ||
       /\/bookview\/view/i.test(window.location.pathname) ||
-      /pages\.push|\/FileStore\/dataFiles/i.test(html)
+      hasDownloadSourceInHtml(html)
     );
   }
 
@@ -1209,13 +1217,15 @@
       downloadAllPages,
       extractPageUrls,
       fetchPageBytesWithRetry,
+      hasDownloadSourceInHtml,
       missingPageIndexes,
       retryDelayMs,
+      shouldInject,
       shouldRetryStatus
     };
   }
 
-  if (shouldInject()) {
+  if (!window.__kaznebDownloaderDisableAutoInject && shouldInject()) {
     createInlineControls();
     const observer = new MutationObserver(() => {
       createInlineControls();

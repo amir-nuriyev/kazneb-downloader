@@ -13,6 +13,10 @@ extension hides the official button and leaves its own generated-PDF button in
 place. On Kazakh Latin pages it still fixes the official button label from
 `Download` to `Jukteu` before hiding it.
 
+If a catalogue page has no viewer, no native PDF, and no numeric page image
+URLs, the extension does not add a download button. Cover images such as
+`bigcover.png` do not count as book pages.
+
 ## Install
 
 1. Open Chrome and go to `chrome://extensions`.

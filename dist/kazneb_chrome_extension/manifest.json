@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "KazNEB Downloader",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "description": "Adds an inline Download button to KazNEB catalogue pages and saves page images as a compact PDF.",
   "permissions": [],
   "host_permissions": [

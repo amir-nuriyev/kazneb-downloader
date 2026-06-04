@@ -71,15 +71,20 @@ function createElement(tagName) {
   };
 }
 
-function loadExtension({ fetchImpl, random = () => 0 } = {}) {
+function loadExtension({
+  fetchImpl,
+  html = "",
+  random = () => 0,
+  url = "https://example.test/ru/catalogue/view/1"
+} = {}) {
   const code = fs.readFileSync(CONTENT_PATH, "utf8");
-  const location = new URL("https://example.test/ru/catalogue/view/1");
+  const location = new URL(url);
   const document = {
     title: "Fallback title | KazNEB",
     body: createElement("body"),
     documentElement: {
       lang: "",
-      outerHTML: ""
+      outerHTML: html
     },
     createElement,
     getElementById() {
@@ -130,6 +135,7 @@ function loadExtension({ fetchImpl, random = () => 0 } = {}) {
     },
     setTimeout,
     window: {
+      __kaznebDownloaderDisableAutoInject: true,
       __kaznebDownloaderExposeTestApi: true,
       location
     }
@@ -213,6 +219,49 @@ test("extractPageUrls decodes HTML entities and de-duplicates URLs", () => {
       "https://kazneb.kz/FileStore/dataFiles/aa/bb/1/content/0002.png?time=2&key=b"
     ]
   );
+});
+
+test("cover images alone are not treated as downloadable page images", () => {
+  const api = loadExtension();
+  const html = `
+    <img src="/FileStore/dataFiles/60/4d/414682/content/bigcover.png?time=1&amp;key=cover">
+    <source srcset="/FileStore/dataFiles/60/4d/414682/content/bigcover.png?time=1&amp;key=cover">
+  `;
+
+  assert.deepEqual(Array.from(api.extractPageUrls(html, "https://kazneb.kz/ru/catalogue/view/414682")), []);
+  assert.equal(api.hasDownloadSourceInHtml(html), false);
+});
+
+test("catalogue pages without a viewer, native PDF, or page images do not inject", () => {
+  const api = loadExtension({
+    url: "https://kazneb.kz/ru/catalogue/view/414682",
+    html: `
+      <div class="book-actions"></div>
+      <img src="/FileStore/dataFiles/60/4d/414682/content/bigcover.png?time=1&amp;key=cover">
+    `
+  });
+
+  assert.equal(api.shouldInject(), false);
+});
+
+test("catalogue pages with a viewer link still inject", () => {
+  const api = loadExtension({
+    url: "https://kazneb.kz/ru/catalogue/view/1658804",
+    html: '<a href="/ru/bookView/view?brId=1658804&amp;simple=true">Просмотр</a>'
+  });
+
+  assert.equal(api.shouldInject(), true);
+});
+
+test("numeric FileStore page images still count as downloadable sources", () => {
+  const api = loadExtension();
+  const html = '<script>const p="/FileStore/dataFiles/aa/bb/1/content/0001.png?time=1&amp;key=a";</script>';
+
+  assert.deepEqual(
+    Array.from(api.extractPageUrls(html, "https://kazneb.kz/ru/bookView/view?brId=1")),
+    ["https://kazneb.kz/FileStore/dataFiles/aa/bb/1/content/0001.png?time=1&key=a"]
+  );
+  assert.equal(api.hasDownloadSourceInHtml(html), true);
 });
 
 test("retry status and backoff calculations match the intended policy", () => {
