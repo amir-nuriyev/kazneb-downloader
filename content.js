@@ -356,7 +356,7 @@
     };
   }
 
-  async function fetchWithTimeout(url, options, timeoutMs, parentSignal) {
+  async function fetchWithTimeout(url, options, timeoutMs, parentSignal, consumeResponse = null) {
     throwIfAborted(parentSignal);
     const controller = new AbortController();
     const abortFromParent = () => controller.abort(parentSignal.reason);
@@ -367,10 +367,11 @@
     }
 
     try {
-      return await fetch(url, {
+      const response = await fetch(url, {
         ...options,
         signal: controller.signal
       });
+      return consumeResponse ? await consumeResponse(response) : response;
     } catch (error) {
       if (parentSignal && parentSignal.aborted) {
         throw new DOMException("Download cancelled.", "AbortError");
@@ -535,21 +536,22 @@
 
   async function fetchText(url, refererUrl, signal, debug) {
     debug?.log("fetch-text-start", { url });
-    const response = await fetchWithTimeout(url, {
+    return fetchWithTimeout(url, {
       credentials: "include",
       priority: "high",
       referrer: refererUrl || window.location.href
-    }, TEXT_FETCH_TIMEOUT_MS, signal);
-    debug?.log("fetch-text-response", {
-      url,
-      status: response.status,
-      ok: response.ok,
-      contentType: response.headers.get("content-type") || null
+    }, TEXT_FETCH_TIMEOUT_MS, signal, async (response) => {
+      debug?.log("fetch-text-response", {
+        url,
+        status: response.status,
+        ok: response.ok,
+        contentType: response.headers.get("content-type") || null
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} while fetching ${url}`);
+      }
+      return response.text();
     });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} while fetching ${url}`);
-    }
-    return response.text();
   }
 
   async function resolvePages(setProgress, signal, debug) {
@@ -635,6 +637,10 @@
   }
 
   function concatBytes(parts) {
+    if (parts.length === 1) {
+      return parts[0];
+    }
+
     const length = parts.reduce((sum, part) => sum + part.length, 0);
     const output = new Uint8Array(length);
     let offset = 0;
@@ -675,7 +681,7 @@
         throw new Error("Invalid PNG chunk length.");
       }
 
-      const data = bytes.slice(dataStart, dataEnd);
+      const data = bytes.subarray(dataStart, dataEnd);
       if (type === "IHDR") {
         width = readUint32(data, 0);
         height = readUint32(data, 4);
@@ -790,6 +796,45 @@
     }
   }
 
+  async function prebuildPdfPages(pages, pageLimit, dpi, debug, shouldContinue = () => true) {
+    if (!Array.isArray(pages) || !pages.length) {
+      return 0;
+    }
+
+    const limit = normalizePageLimit(pageLimit, pages.length);
+    let built = 0;
+    for (let index = 0; index < limit; index += 1) {
+      if (!shouldContinue()) {
+        debug?.log("pdf-prebuild-stopped", {
+          built,
+          targetPages: limit
+        });
+        break;
+      }
+
+      const page = pages[index];
+      if (!page || !page.bytes || page.pdfPrepared) {
+        continue;
+      }
+
+      if (prebuildPdfPage(page, dpi, debug)) {
+        built += 1;
+      }
+
+      if (built > 0 && built % 8 === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+
+    if (built) {
+      debug?.log("pdf-prebuild-batch-done", {
+        built,
+        targetPages: limit
+      });
+    }
+    return built;
+  }
+
   function warmKaznebTransport() {
     const host = document.head || document.documentElement;
     if (!host || document.getElementById("kazneb-dl-preconnect")) {
@@ -844,10 +889,12 @@
         )
       );
 
-      setProgress(
-        100,
-        `Compiling PDF ${index + 1}/${pages.length}...`
-      );
+      if (index === 0 || index === pages.length - 1 || (index + 1) % 8 === 0) {
+        setProgress(
+          100,
+          `Compiling PDF ${index + 1}/${pages.length}...`
+        );
+      }
     });
 
     objects[0] = encodeText("<< /Type /Catalog /Pages 2 0 R >>");
@@ -888,25 +935,26 @@
 
   async function fetchPageBytesOnce(url, referer, signal) {
     const networkProfile = getNetworkProfile();
-    const response = await fetchWithTimeout(url, {
+    return fetchWithTimeout(url, {
       credentials: "include",
       priority: "high",
       referrer: referer
-    }, networkProfile.pageFetchTimeoutMs, signal);
-    if (!response.ok) {
-      if (shouldRetryStatus(response.status)) {
-        const error = new Error(`HTTP ${response.status}`);
-        error.retryable = true;
-        error.response = response;
-        throw error;
+    }, networkProfile.pageFetchTimeoutMs, signal, async (response) => {
+      if (!response.ok) {
+        if (shouldRetryStatus(response.status)) {
+          const error = new Error(`HTTP ${response.status}`);
+          error.retryable = true;
+          error.response = response;
+          throw error;
+        }
+        throw new Error(`HTTP ${response.status} while downloading ${url}`);
       }
-      throw new Error(`HTTP ${response.status} while downloading ${url}`);
-    }
-    const contentType = response.headers.get("content-type") || "";
-    if (contentType && !contentType.toLowerCase().startsWith("image/")) {
-      throw new Error(`Expected an image, got ${contentType}`);
-    }
-    return response.arrayBuffer();
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType && !contentType.toLowerCase().startsWith("image/")) {
+        throw new Error(`Expected an image, got ${contentType}`);
+      }
+      return response.arrayBuffer();
+    });
   }
 
   async function fetchPageBytesWithRetry(url, referer, options) {
@@ -1047,6 +1095,11 @@
           5 + Math.round((completed / targetPageCount) * 95),
           `Retrying ${missingIndexes.length} missing page${missingIndexes.length === 1 ? "" : "s"}...`
         );
+      } else {
+        setProgress(
+          5 + Math.round((completed / targetPageCount) * 95),
+          `Downloading pages ${completed}/${targetPageCount}...`
+        );
       }
 
       let cursor = 0;
@@ -1082,12 +1135,6 @@
             });
             continue;
           }
-          const percent = 5 + Math.round((completed / targetPageCount) * 95);
-          setProgress(
-            percent,
-            `Downloading pages ${completed}/${targetPageCount}...`
-          );
-
           try {
             let pagePromise = inFlightPages ? inFlightPages[index] : null;
             if (!pagePromise) {
@@ -1322,7 +1369,7 @@
             current.pages,
             targetPages,
             current.inFlightPages,
-            (page) => prebuildPdfPage(page, 300, debug),
+            null,
             {
               shouldStopScheduling: () => current.claimed
             }
@@ -1333,6 +1380,13 @@
             targetPages,
             totalPages: resolved.pageUrls.length
           });
+          await prebuildPdfPages(
+            current.pages,
+            targetPages,
+            300,
+            debug,
+            () => !current.claimed
+          );
           if (targetPagesForPrefetch(current) <= targetPages) {
             break;
           }
@@ -1861,6 +1915,30 @@
     );
   }
 
+  function isDownloaderNode(node) {
+    if (!node || node.nodeType !== 1) {
+      return false;
+    }
+
+    return Boolean(
+      node.matches?.("#kazneb-download-inline-button, .kazneb-dl-progress-wrap") ||
+        node.closest?.("#kazneb-download-inline-button, .kazneb-dl-progress-wrap")
+    );
+  }
+
+  function isDownloaderMutation(mutation) {
+    if (isDownloaderNode(mutation.target)) {
+      return true;
+    }
+
+    const changedNodes = [
+      ...mutation.addedNodes,
+      ...mutation.removedNodes
+    ].filter((node) => node.nodeType === 1);
+
+    return changedNodes.length > 0 && changedNodes.every(isDownloaderNode);
+  }
+
   if (window.__kaznebDownloaderExposeTestApi) {
     window.__kaznebDownloaderTestApi = {
       abortableDelay,
@@ -1877,9 +1955,11 @@
       hasDownloadSourceInHtml,
       isPointerNearElement,
       isPointerMovingTowardElement,
+      isDownloaderMutation,
       missingPageIndexes,
       pointerDistanceToElement,
       prebuildPdfPage,
+      prebuildPdfPages,
       preparePdfPage,
       retryDelayMs,
       shouldInject,
@@ -1889,7 +1969,10 @@
 
   if (!window.__kaznebDownloaderDisableAutoInject && shouldInject()) {
     createInlineControls();
-    const observer = new MutationObserver(() => {
+    const observer = new MutationObserver((mutations) => {
+      if (mutations.length && mutations.every(isDownloaderMutation)) {
+        return;
+      }
       createInlineControls();
     });
     observer.observe(document.documentElement, {

@@ -346,6 +346,41 @@ test("fetchPageBytesWithRetry retries retryable HTTP errors", async () => {
   assert.deepEqual([...new Uint8Array(bytes)], [7, 8, 9]);
 });
 
+test("page fetch abort remains active while reading the response body", async () => {
+  let fetchSignal = null;
+  const controller = new AbortController();
+  const api = loadExtension({
+    fetchImpl: async (_url, options = {}) => {
+      fetchSignal = options.signal;
+      return {
+        ...response(),
+        async arrayBuffer() {
+          return new Promise((_resolve, reject) => {
+            fetchSignal.addEventListener("abort", () => {
+              reject(new DOMException("Download cancelled.", "AbortError"));
+            }, { once: true });
+          });
+        }
+      };
+    }
+  });
+
+  const download = api.fetchPageBytesWithRetry("https://kazneb.kz/page.png", "https://kazneb.kz/", {
+    debug: testDebug(),
+    pacer: { waitTurn: async () => {} },
+    pageNumber: 1,
+    setProgress: () => {},
+    signal: controller.signal,
+    totalPages: 1,
+    workerId: 1
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  controller.abort();
+
+  await assert.rejects(download, /Download cancelled/);
+});
+
 test("429 responses trigger a shared cooldown before retrying", async () => {
   let calls = 0;
   const cooldowns = [];
@@ -483,6 +518,27 @@ test("downloadAllPages can target only the first N pages for approach prefetch",
   assert.equal(api.countDownloadedPages(pages), 2);
   assert.deepEqual(Array.from(api.missingPageIndexes(pages, 2)), []);
   assert.deepEqual(Array.from(api.missingPageIndexes(pages)), [2, 3]);
+});
+
+test("downloadAllPages avoids per-request progress writes while workers start", async () => {
+  const urls = [1, 2, 3].map((page) => `https://kazneb.kz/FileStore/book/${String(page).padStart(4, "0")}.png`);
+  const messages = [];
+  const api = loadExtension({
+    fetchImpl: async (url) => response({ bytes: Uint8Array.of(Number(url.match(/(\d+)\.png$/)[1])) })
+  });
+
+  await api.downloadAllPages(
+    urls,
+    "https://kazneb.kz/",
+    (_percent, message) => messages.push(message),
+    new AbortController().signal,
+    testDebug()
+  );
+
+  assert.equal(
+    messages.filter((message) => /^Downloading pages /.test(message)).length,
+    urls.length + 1
+  );
 });
 
 test("downloadAllPages reuses in-flight page downloads instead of restarting them", async () => {
@@ -686,6 +742,53 @@ test("pointer proximity treats nearby cursor positions as download intent", () =
   );
 });
 
+test("Mutation observer ignores downloader-owned DOM changes", () => {
+  const api = loadExtension();
+  const progressWrap = {
+    nodeType: 1,
+    matches(selector) {
+      return selector.includes(".kazneb-dl-progress-wrap");
+    },
+    closest() {
+      return null;
+    }
+  };
+  const statusNode = {
+    nodeType: 1,
+    matches() {
+      return false;
+    },
+    closest(selector) {
+      return selector.includes(".kazneb-dl-progress-wrap") ? progressWrap : null;
+    }
+  };
+  const pageNode = {
+    nodeType: 1,
+    matches() {
+      return false;
+    },
+    closest() {
+      return null;
+    }
+  };
+
+  assert.equal(api.isDownloaderMutation({
+    target: statusNode,
+    addedNodes: [],
+    removedNodes: []
+  }), true);
+  assert.equal(api.isDownloaderMutation({
+    target: pageNode,
+    addedNodes: [progressWrap],
+    removedNodes: []
+  }), true);
+  assert.equal(api.isDownloaderMutation({
+    target: pageNode,
+    addedNodes: [pageNode],
+    removedNodes: []
+  }), false);
+});
+
 test("downloadAllPages reports pages that remain missing after retry passes", async () => {
   const urls = [1, 2].map((page) => `https://kazneb.kz/FileStore/book/${String(page).padStart(4, "0")}.png`);
   const callsByUrl = new Map();
@@ -716,6 +819,29 @@ test("PDF builder refuses empty or incomplete page sets", () => {
     () => api.buildPdfFromPngs([null], 300, () => {}),
     /1 page.*missing/
   );
+});
+
+test("PDF prebuild batches can stop when prefetch is claimed", async () => {
+  const api = loadExtension();
+  const pages = Array.from({ length: 12 }, (_, index) => ({
+    url: `https://kazneb.kz/${index + 1}.png`,
+    bytes: tinyPngBytes().buffer
+  }));
+  let checks = 0;
+
+  const built = await api.prebuildPdfPages(
+    pages,
+    pages.length,
+    300,
+    testDebug(),
+    () => {
+      checks += 1;
+      return checks <= 5;
+    }
+  );
+
+  assert.equal(built, 5);
+  assert.equal(pages.filter((page) => page.pdfPrepared).length, 5);
 });
 
 test("PDF compilation keeps the progress bar full after downloads are complete", async () => {
