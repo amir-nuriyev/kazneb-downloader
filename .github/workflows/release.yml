@@ -1,0 +1,61 @@
+name: Release Chrome extension
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate extension
+        run: |
+          npm test
+          node --check dist/kazneb_chrome_extension/content.js
+          python -m json.tool dist/kazneb_chrome_extension/manifest.json >/dev/null
+
+      - name: Determine release tag
+        id: release
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            version="$(node -p "require('./dist/kazneb_chrome_extension/manifest.json').version")"
+            tag="v${version}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "asset=kazneb-chrome-extension-${tag}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Package extension
+        run: |
+          cd dist
+          zip -r "../${{ steps.release.outputs.asset }}" kazneb_chrome_extension
+
+      - name: Create release and upload extension
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.release.outputs.tag }}"
+          asset="${{ steps.release.outputs.asset }}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${asset}" --clobber
+          else
+            gh release create "${tag}" "${asset}" \
+              --target "${GITHUB_SHA}" \
+              --title "KazNEB Chrome Extension ${tag}" \
+              --notes "Download and unzip \`${asset}\`, then load the unzipped \`kazneb_chrome_extension\` folder in Chrome via \`chrome://extensions\` -> Developer mode -> Load unpacked."
+          fi
